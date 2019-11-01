@@ -356,7 +356,7 @@ class KafkaClient(object):
             time.sleep(3)
 
         self._avro_deserializers[topic_name] = confluent_kafka.avro.MessageSerializer(
-                self._schema_registry, key_schema, value_schema)
+            self._schema_registry, key_schema, value_schema)
 
         return key_schema_id, value_schema_id
 
@@ -399,4 +399,3 @@ class KafkaClient(object):
 
         key = (kind, msg.topic())
         self._progress_messages_awaiting_commit[key][msg.partition()] = (produce_sequence, progress_msg)
-

@@ -3,10 +3,12 @@ import logging.config
 import sentry_sdk
 
 from .avro_from_sql import *
-from .cli import *
 from .constants import *
 from .kafka import *
+from .main import *
+from .options import *
 from .tracked_tables import *
+from .validation import *
 
 sentry_sdk.init()
 
