@@ -45,16 +45,13 @@ def run() -> None:
                            opts.progress_topic_name,
                            tracked_tables.TrackedTable.capture_instance_name_resolver,
                            opts.extra_kafka_consumer_config,
-                           opts.extra_kafka_producer_config) as kafka_client, db_conn:
+                           opts.extra_kafka_producer_config) as kafka_client, \
+            get_db_conn(opts.db_conn_string) as db_conn:
 
-        tables = tracked_tables.build_tracked_tables_from_cdc_metadata(db_conn,
-                                                                       opts.topic_name_template,
-                                                                       opts.table_whitelist_regex,
-                                                                       opts.table_blacklist_regex,
-                                                                       opts.snapshot_table_whitelist_regex,
-                                                                       opts.snapshot_table_blacklist_regex,
-                                                                       opts.capture_instance_version_strategy,
-                                                                       opts.capture_instance_version_regex)
+        tables = tracked_tables.build_tracked_tables_from_cdc_metadata(
+            db_conn,  opts.topic_name_template, opts.table_whitelist_regex, opts.table_blacklist_regex,
+            opts.snapshot_table_whitelist_regex, opts.snapshot_table_blacklist_regex,
+            opts.capture_instance_version_strategy, opts.capture_instance_version_regex)
 
         determine_start_points_and_finalize_tables(
             kafka_client, tables, opts.lsn_gap_handling, opts.partition_count, opts.replication_factor,
@@ -77,18 +74,18 @@ def run() -> None:
             pq.put((priority_tuple, msg_key, msg_value, table))
 
         metrics_interval = datetime.timedelta(seconds=opts.metric_reporting_interval)
-        last_metrics_emission_time = datetime.datetime.now()
-        last_published_change_msg_db_time = datetime.datetime.now() - datetime.timedelta(days=1)
+        last_metrics_emission_time = datetime.datetime.utcnow()
+        last_published_change_msg_db_time = datetime.datetime.utcnow() - datetime.timedelta(days=1)
         metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
         pop_time_total, produce_time_total, publish_count = 0.0, 0.0, 0
 
         try:
             while True:
-                if (datetime.datetime.now() - last_metrics_emission_time) > metrics_interval:
+                if (datetime.datetime.utcnow() - last_metrics_emission_time) > metrics_interval:
                     metrics_accum.determine_lags(last_published_change_msg_db_time, any([t.lagging for t in tables]))
                     for reporter in reporters:
                         reporter.emit(metrics_accum)
-                    last_metrics_emission_time = datetime.datetime.now()
+                    last_metrics_emission_time = datetime.datetime.utcnow()
                     metrics_accum = metric_reporters.MetricsAccumulator(db_conn)
                     if publish_count:
                         logger.debug('Timings per msg: DB (pop) - %s us, Kafka (produce/commit) - %s us',
@@ -107,7 +104,8 @@ def run() -> None:
                     if msg_value and msg_value[constants.OPERATION_NAME] != constants.SNAPSHOT_OPERATION_NAME:
                         last_published_change_msg_db_time = priority_tuple[0]
 
-                    if msg_value[constants.OPERATION_NAME] == 'Delete' and not opts.disable_deletion_tombstones:
+                    if msg_value[constants.OPERATION_NAME] == constants.DELETE_OPERATION_NAME \
+                            and not opts.disable_deletion_tombstones:
                         start_time = time.perf_counter()
                         kafka_client.produce(
                             table.topic_name, msg_key, table.key_schema_id, None, table.value_schema_id)
@@ -144,7 +142,7 @@ def determine_start_points_and_finalize_tables(
     first_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
 
     logger.info('Pausing briefly to ensure target topics are not receiving new messages from elsewhere...')
-    time.sleep(constants.STABLE_WATERMARK_CHECKS_INTERVAL_SECONDS)
+    time.sleep(constants.STABLE_WATERMARK_CHECKS_DELAY_SECONDS)
 
     watermarks_by_topic = kafka_client.get_topic_watermarks(topic_names)
     second_check_watermarks_json = json.dumps(watermarks_by_topic, indent=4)
@@ -203,3 +201,22 @@ def determine_start_points_and_finalize_tables(
     logger.info('Processing will proceed from the following positions based on the last message from each topic '
                 'and/or the snapshot progress committed in Kafka (NB: snapshot reads occur BACKWARDS from high to '
                 'low key column values):\n%s', table)
+
+
+def get_db_conn(odbc_conn_string: str) -> pyodbc.Connection:
+    # The Linux ODBC driver doesn't do failover, so we're hacking it in here. This will only work for initial
+    # connections. If a failover happens while this process is running, the app will crash. Have a process supervisor
+    # that can restart it if that happens, and it'll connect to the failover on restart:
+    # THIS ASSUMES that you are using the exact keywords 'SERVER' and 'Failover_Partner' in your connection string!
+    try:
+        return pyodbc.connect(odbc_conn_string)
+    except pyodbc.ProgrammingError as e:
+        if e.args[0] != '42000':
+            raise
+        server = re.match(r".*SERVER=(.*?);", odbc_conn_string)
+        failover_partner = re.match(r".*Failover_Partner=(.*?);", odbc_conn_string)
+        if failover_partner is not None and server is not None:
+            failover_partner = failover_partner.groups(1)[0]
+            server = server.groups(1)[0]
+            odbc_conn_string = odbc_conn_string.replace(server, failover_partner)
+            return pyodbc.connect(odbc_conn_string)
